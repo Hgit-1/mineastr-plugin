@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+
+# AstrBot local/runtime state
+data/
+logs/
+*.log
+.env
+/astrbot_plugin_mineastr.zip
+
+# Gradle / Java / NeoForge
+.gradle/
+**/.gradle/
+build/
+**/build/
+out/
+**/out/
+run/
+**/run/
+*.class
+*.jar
+!gradle/wrapper/gradle-wrapper.jar
+!**/gradle/wrapper/gradle-wrapper.jar
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# OS
+Thumbs.db
+.DS_Store
+template/helloworld-master/LICENSE
+template/helloworld-master/main.py
+template/helloworld-master/README.md
+template/helloworld-master/metadata.yaml
