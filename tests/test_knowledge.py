@@ -226,6 +226,86 @@ class KnowledgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(len(chunk) <= knowledge.RAG_EMBEDDING_CHUNK_CHARS for chunk in chunks))
         self.assertIn(long_marker, "".join(chunks))
 
+    def test_rag_documents_keep_registry_records_whole(self):
+        snapshot = self.coordinator._snapshots["server-a"]
+        snapshot["categories"]["items"] = [
+            {
+                "id": f"example:item_{index}",
+                "namespace": "example",
+                "description": "x" * 900,
+            }
+            for index in range(80)
+        ]
+
+        chunks = self.coordinator._rag_documents(snapshot)["registry:example:items:0"]
+
+        self.assertGreater(len(chunks), 1)
+        seen = []
+        for chunk in chunks:
+            self.assertLessEqual(len(chunk), knowledge.RAG_EMBEDDING_CHUNK_CHARS)
+            lines = chunk.splitlines()
+            self.assertEqual(lines[0], "# example items")
+            self.assertTrue(lines[1].startswith("信任规则"))
+            for line in lines[2:]:
+                seen.append(json.loads(line)["id"])
+        self.assertEqual(seen, [f"example:item_{index}" for index in range(80)])
+
+    def test_rag_documents_split_oversized_recipe_into_identified_parts(self):
+        snapshot = self.coordinator._snapshots["server-a"]
+        snapshot["categories"]["recipes"] = [{
+            "id": "example:huge_recipe",
+            "namespace": "example",
+            "type": "minecraft:crafting",
+            "ingredients": [
+                {
+                    "alternatives": [{
+                        "id": f"example:ingredient_{index}",
+                        "name": "材料" * 40,
+                    }]
+                }
+                for index in range(60)
+            ],
+            "result": {"id": "example:output", "name": "Output", "count": 1},
+            "tail_marker": "配方尾部唯一标记",
+        }]
+
+        chunks = self.coordinator._rag_documents(snapshot)["registry:example:recipes:0"]
+
+        self.assertGreater(len(chunks), 1)
+        self.assertTrue(all("example:huge_recipe" in chunk for chunk in chunks))
+        self.assertTrue(all("example:output" in chunk for chunk in chunks))
+        self.assertTrue(any("第 1/" in chunk for chunk in chunks))
+        joined = "\n".join(chunks)
+        self.assertIn("example:ingredient_59", joined)
+        self.assertIn("配方尾部唯一标记", joined)
+
+    def test_rag_documents_split_long_site_text_without_truncation(self):
+        snapshot = self.coordinator._snapshots["server-a"]
+        marker = "官网尾部唯一标记"
+        url = "https://example.com/wiki"
+        snapshot["server_site"] = {
+            "pages": [{
+                "url": url,
+                "title": "Wiki",
+                "text": "a" * knowledge.MAX_REMOTE_TEXT_BYTES + marker,
+                "source_trust": "reference",
+                "confirmation_status": "unreviewed",
+                "sources": [{
+                    "source_id": "site:x",
+                    "source_type": "server_site",
+                    "trust": "reference",
+                    "status": "unreviewed",
+                }],
+            }],
+        }
+
+        source_id = "site:" + knowledge._json_hash(url)[:20]
+        chunks = self.coordinator._rag_documents(snapshot)[source_id]
+
+        self.assertGreater(len(chunks), 80)
+        self.assertIn(marker, "".join(chunks))
+        self.assertTrue(all(len(chunk) <= knowledge.RAG_EMBEDDING_CHUNK_CHARS for chunk in chunks))
+
     def test_site_candidates_are_same_origin_and_drop_assets(self):
         candidates = []
         self.coordinator._add_same_origin_candidate(
