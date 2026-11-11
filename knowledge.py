@@ -11,7 +11,7 @@ import urllib.parse
 import urllib.robotparser
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import aiohttp
 from astrbot.api import logger
@@ -1937,12 +1937,16 @@ class KnowledgeCoordinator:
     @staticmethod
     def _split_rag_record(header: str, entry: dict[str, Any]) -> list[str]:
         """Split one oversized registry record at top-level field boundaries."""
-        identity = {
-            key: KnowledgeCoordinator._stable_rag_value(entry[key])
-            for key in RAG_RECORD_IDENTITY_KEYS
-            if key in entry
-        }
+        identity: dict[str, Any] = {}
+        for key in RAG_RECORD_IDENTITY_KEYS:
+            if key not in entry:
+                continue
+            candidate = {**identity, key: KnowledgeCoordinator._stable_rag_value(entry[key])}
+            if len(json.dumps(candidate, ensure_ascii=False, sort_keys=True)) <= RAG_EMBEDDING_CHUNK_CHARS // 4:
+                identity = candidate
         record_id = str(entry.get("id") or entry.get("name") or "unknown")
+        if len(record_id) > 256:
+            record_id = f"{record_id[:220]}… [{_json_hash(record_id)[:16]}]"
         identity_text = json.dumps(identity, ensure_ascii=False, sort_keys=True)
 
         # A recipe's result is short but essential: repeat it in every part so a
@@ -1952,25 +1956,25 @@ class KnowledgeCoordinator:
         for key in ("result",):
             if key not in entry:
                 continue
-            candidate = KnowledgeCoordinator._rag_field_fragments(
-                key,
-                KnowledgeCoordinator._stable_rag_value(entry[key]),
-                max(256, RAG_EMBEDDING_CHUNK_CHARS // 4),
+            candidate = json.dumps(
+                {key: KnowledgeCoordinator._stable_rag_value(entry[key])},
+                ensure_ascii=False, sort_keys=True,
             )
-            if len(candidate) == 1:
+            if len(candidate) <= RAG_EMBEDDING_CHUNK_CHARS // 4:
                 shared_fields.add(key)
-                shared_fragments.append(candidate[0][1])
-        shared_size = sum(len(fragment) + 1 for fragment in shared_fragments)
-        budget = max(
-            512,
-            RAG_EMBEDDING_CHUNK_CHARS - len(header) - len(identity_text) - shared_size - 96,
-        )
+                shared_fragments.append(candidate)
+        # At most one part per serialized character; reserve the full label,
+        # including long IDs and enough digits before packing any field.
+        digits = len(str(len(json.dumps(entry, ensure_ascii=False))))
+        largest_label = f"记录: {record_id}（第 {'9' * digits}/{'9' * digits} 部分）"
+        prefix_size = len("\n".join([header, largest_label, identity_text, *shared_fragments]))
+        budget = RAG_EMBEDDING_CHUNK_CHARS - prefix_size - 1
 
         fragments: list[tuple[str, str]] = []
         for key in sorted(
             str(key)
             for key in entry
-            if key not in RAG_RECORD_IDENTITY_KEYS and str(key) not in shared_fields
+            if key not in identity and str(key) not in shared_fields
         ):
             fragments.extend(
                 KnowledgeCoordinator._rag_field_fragments(
@@ -2004,86 +2008,70 @@ class KnowledgeCoordinator:
             label = f"记录: {record_id}"
             if total > 1:
                 label += f"（第 {index}/{total} 部分）"
-            chunk = "\n".join([header, label, identity_text, *shared_fragments, *part])
-            if len(chunk) <= RAG_EMBEDDING_CHUNK_CHARS:
-                chunks.append(chunk)
-            else:
-                chunks.extend(
-                    KnowledgeCoordinator._split_rag_text(
-                        chunk, limit=RAG_EMBEDDING_CHUNK_CHARS
-                    )
-                )
+            chunks.append("\n".join([header, label, identity_text, *shared_fragments, *part]))
         return chunks
 
     @staticmethod
     def _rag_field_fragments(key: str, value: Any, budget: int) -> list[tuple[str, str]]:
-        """Render a top-level record field as JSON fragments that fit ``budget``."""
+        """Split nested values while measuring their complete JSON wrappers."""
         def render(raw: Any) -> str:
             return json.dumps({key: raw}, ensure_ascii=False, sort_keys=True)
 
-        if len(render(value)) <= budget:
-            return [(key, render(value))]
-        if isinstance(value, list):
-            fragments: list[tuple[str, str]] = []
-            batch: list[Any] = []
-            for item in value:
-                if len(render(batch + [item])) <= budget:
-                    batch.append(item)
-                    continue
+        def split(raw: Any, wrapped: Callable[[Any], str]) -> list[str]:
+            text = wrapped(raw)
+            if len(text) <= budget:
+                return [text]
+            fragments: list[str] = []
+            if isinstance(raw, list):
+                batch: list[Any] = []
+                for item in raw:
+                    if len(wrapped(batch + [item])) <= budget:
+                        batch.append(item)
+                        continue
+                    if batch:
+                        fragments.append(wrapped(batch))
+                        batch = []
+                    if len(wrapped([item])) <= budget:
+                        batch = [item]
+                    else:
+                        fragments.extend(split(item, lambda part: wrapped([part])))
                 if batch:
-                    fragments.append((key, render(batch)))
-                    batch = []
-                if len(render([item])) <= budget:
-                    batch = [item]
-                else:
-                    raw = json.dumps(item, ensure_ascii=False, sort_keys=True)
-                    overhead = len(render([""]))
-                    for piece in KnowledgeCoordinator._split_rag_text(
-                        raw, limit=max(64, budget - overhead)
-                    ):
-                        fragments.append((key, render([piece])))
-            if batch:
-                fragments.append((key, render(batch)))
+                    fragments.append(wrapped(batch))
+            elif isinstance(raw, dict):
+                mapping: dict[str, Any] = {}
+                for sub_key in sorted(raw):
+                    item = raw[sub_key]
+                    if len(wrapped({**mapping, sub_key: item})) <= budget:
+                        mapping[sub_key] = item
+                        continue
+                    if mapping:
+                        fragments.append(wrapped(mapping))
+                        mapping = {}
+                    if len(wrapped({sub_key: item})) <= budget:
+                        mapping[sub_key] = item
+                    else:
+                        fragments.extend(split(item, lambda part, field=sub_key: wrapped({field: part})))
+                if mapping:
+                    fragments.append(wrapped(mapping))
+            elif isinstance(raw, str):
+                start = 0
+                while start < len(raw):
+                    low, high = start, min(len(raw), start + budget)
+                    while low < high:
+                        middle = (low + high + 1) // 2
+                        if len(wrapped(raw[start:middle])) <= budget:
+                            low = middle
+                        else:
+                            high = middle - 1
+                    if low == start:
+                        raise ValueError(f"RAG field {key!r} has no room for content")
+                    fragments.append(wrapped(raw[start:low]))
+                    start = low
+            if not fragments:
+                raise ValueError(f"RAG field {key!r} cannot fit its JSON path in {budget} characters")
             return fragments
-        if isinstance(value, dict):
-            fragments = []
-            batch: dict[str, Any] = {}
-            for sub_key in sorted(str(item) for item in value):
-                if len(render({**batch, sub_key: value[sub_key]})) <= budget:
-                    batch[sub_key] = value[sub_key]
-                    continue
-                if batch:
-                    fragments.append((key, render(batch)))
-                    batch = {}
-                single = {sub_key: value[sub_key]}
-                if len(render(single)) <= budget:
-                    batch = single
-                else:
-                    raw = json.dumps(value[sub_key], ensure_ascii=False, sort_keys=True)
-                    overhead = len(render({sub_key: ""}))
-                    for piece in KnowledgeCoordinator._split_rag_text(
-                        raw, limit=max(64, budget - overhead)
-                    ):
-                        fragments.append((key, render({sub_key: piece})))
-            if batch:
-                fragments.append((key, render(batch)))
-            return fragments
-        if isinstance(value, str):
-            overhead = len(render(""))
-            return [
-                (key, render(piece))
-                for piece in KnowledgeCoordinator._split_rag_text(
-                    value, limit=max(64, budget - overhead)
-                )
-            ]
-        raw = json.dumps(value, ensure_ascii=False, sort_keys=True)
-        overhead = len(render(""))
-        return [
-            (key, render(piece))
-            for piece in KnowledgeCoordinator._split_rag_text(
-                raw, limit=max(64, budget - overhead)
-            )
-        ]
+
+        return [(key, text) for text in split(value, render)]
 
     @staticmethod
     def _stable_rag_value(value: Any) -> Any:

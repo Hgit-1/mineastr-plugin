@@ -279,6 +279,113 @@ class KnowledgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("example:ingredient_59", joined)
         self.assertIn("配方尾部唯一标记", joined)
 
+    def test_rag_documents_split_single_oversized_ingredient_group(self):
+        snapshot = self.coordinator._snapshots["server-a"]
+        alternatives = [
+            {"id": f"example:ingredient_{i}", "name": f"Ingredient {i}"}
+            for i in range(200)
+        ]
+        recipe = {
+            "id": "example:huge_recipe",
+            "namespace": "example",
+            "type": "minecraft:crafting",
+            "ingredients": [{"alternatives": alternatives}],
+            "result": {"id": "example:output", "count": 1},
+        }
+        snapshot["categories"]["recipes"] = [recipe]
+
+        chunks = self.coordinator._rag_documents(snapshot)["registry:example:recipes:0"]
+
+        self.assertGreater(len(chunks), 1)
+        recovered = []
+        for index, chunk in enumerate(chunks, 1):
+            self.assertLessEqual(len(chunk), knowledge.RAG_EMBEDDING_CHUNK_CHARS)
+            self.assertIn(recipe["id"], chunk)
+            self.assertIn("example:output", chunk)
+            self.assertIn(f"第 {index}/{len(chunks)} 部分", chunk)
+            for line in chunk.splitlines()[3:]:
+                fragment = json.loads(line)
+                for group in fragment.get("ingredients", []):
+                    self.assertIsInstance(group, dict)
+                    recovered.extend(group["alternatives"])
+        self.assertEqual(alternatives, recovered)
+
+    def test_rag_nested_dictionary_fragments_preserve_structure(self):
+        original = {"data": {"alternatives": [
+            {"id": f"example:item_{i}", "name": 'Quoted "item" \\ path'}
+            for i in range(200)
+        ]}}
+        fragments = self.coordinator._rag_field_fragments("serializer_data", original, 512)
+
+        self.assertGreater(len(fragments), 1)
+        recovered = []
+        for key, text in fragments:
+            self.assertEqual("serializer_data", key)
+            self.assertLessEqual(len(text), 512)
+            recovered.extend(json.loads(text)[key]["data"]["alternatives"])
+        self.assertEqual(original["data"]["alternatives"], recovered)
+
+    def test_rag_string_fragments_budget_json_escaping_without_losing_whitespace(self):
+        original = ('  "quoted" \\ path\n\t' * 100) + "尾部  "
+        fragments = self.coordinator._rag_field_fragments("description", original, 128)
+
+        self.assertGreater(len(fragments), 1)
+        self.assertTrue(all(len(text) <= 128 for _, text in fragments))
+        self.assertEqual(original, "".join(json.loads(text)[key] for key, text in fragments))
+
+    def test_rag_record_budget_includes_long_identity_label(self):
+        recipe_id = "example:" + "generated_recipe_" * 15
+        snapshot = self.coordinator._snapshots["server-a"]
+        snapshot["categories"]["recipes"] = [{
+            "id": recipe_id,
+            "namespace": "example",
+            "ingredients": [{"alternatives": [
+                {"id": f"example:item_{i}", "name": "材料" * 20}
+                for i in range(200)
+            ]}],
+            "result": {"id": "example:output", "count": 1},
+        }]
+
+        chunks = self.coordinator._rag_documents(snapshot)["registry:example:recipes:0"]
+
+        self.assertGreater(len(chunks), 1)
+        for index, chunk in enumerate(chunks, 1):
+            self.assertLessEqual(len(chunk), knowledge.RAG_EMBEDDING_CHUNK_CHARS)
+            self.assertIn(recipe_id, chunk)
+            self.assertIn("example:output", chunk)
+            self.assertIn(f"第 {index}/{len(chunks)} 部分", chunk)
+            for line in chunk.splitlines()[3:]:
+                json.loads(line)
+
+    def test_rag_registry_page_retains_records_beyond_old_size_limit(self):
+        snapshot = self.coordinator._snapshots["server-a"]
+        snapshot["categories"]["items"] = [
+            {"id": f"example:item_{i}", "namespace": "example", "description": "x" * 5400}
+            for i in range(100)
+        ]
+
+        chunks = self.coordinator._rag_documents(snapshot)["registry:example:items:0"]
+
+        self.assertGreater(sum(map(len, chunks)), knowledge.MAX_REMOTE_TEXT_BYTES)
+        recovered = [json.loads(line)["id"] for chunk in chunks for line in chunk.splitlines()[2:]]
+        self.assertEqual([f"example:item_{i}" for i in range(100)], recovered)
+        self.assertTrue(all(len(chunk) <= knowledge.RAG_EMBEDDING_CHUNK_CHARS for chunk in chunks))
+
+    def test_rag_oversized_name_is_content_not_unbounded_repeated_identity(self):
+        name = "超长名称" * 2000
+        snapshot = self.coordinator._snapshots["server-a"]
+        snapshot["categories"]["items"] = [{"id": "example:named", "name": name}]
+
+        chunks = self.coordinator._rag_documents(snapshot)["registry:example:items:0"]
+
+        self.assertGreater(len(chunks), 1)
+        recovered = []
+        for chunk in chunks:
+            self.assertLessEqual(len(chunk), knowledge.RAG_EMBEDDING_CHUNK_CHARS)
+            self.assertIn("example:named", chunk)
+            recovered.extend(json.loads(line).get("name", "") for line in chunk.splitlines()[3:])
+        self.assertEqual(name, "".join(recovered))
+
     def test_rag_documents_split_long_site_text_without_truncation(self):
         snapshot = self.coordinator._snapshots["server-a"]
         marker = "官网尾部唯一标记"
